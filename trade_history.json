@@ -1,0 +1,102 @@
+[
+    {
+        "timestamp": 1773007710,
+        "time_str": "2026-03-08 22:08:30",
+        "condition_id": "0x9a71cde3056e97a50b3bbf5e3e84c906c13cb3913618b68cc32cddbca3ab944e",
+        "action": "BUY",
+        "side": "UP",
+        "price": 0.92,
+        "size": 5.051,
+        "pnl": null
+    },
+    {
+        "timestamp": 1773008010,
+        "time_str": "2026-03-08 22:13:30",
+        "condition_id": "0xac0419e70bc7eebaf8610359a328d3233597110d977ad5aef3ac17c6e567e1f9",
+        "action": "BUY",
+        "side": "DOWN",
+        "price": 0.4,
+        "size": 5.689653,
+        "pnl": null
+    },
+    {
+        "timestamp": 1773008312,
+        "time_str": "2026-03-08 22:18:32",
+        "condition_id": "0x4214c162e8d68721d2e758c0087407f935c2c81bc959fec70e431e03ab0febe6",
+        "action": "BUY",
+        "side": "DOWN",
+        "price": 0.29,
+        "size": 5.689653,
+        "pnl": null
+    },
+    {
+        "timestamp": 1773008611,
+        "time_str": "2026-03-08 22:23:31",
+        "condition_id": "0xd4f879a9bb6d95c14ed47e6b99e1a0b547e4562742a37f5e8f77015b85bd0abf",
+        "action": "BUY",
+        "side": "DOWN",
+        "price": 0.53,
+        "size": 6.698192,
+        "pnl": 1.0
+    },
+    {
+        "timestamp": 1773008910,
+        "time_str": "2026-03-08 22:28:30",
+        "condition_id": "0x0188d523459ec7bb94e1ded990e6438524f4be6de45957ec94eaeb9c0da6d809",
+        "action": "BUY",
+        "side": "UP",
+        "price": 0.53,
+        "size": 5.051,
+        "pnl": 1.0
+    },
+    {
+        "timestamp": 1773009210,
+        "time_str": "2026-03-08 22:33:30",
+        "condition_id": "0xf0ef7c558a2dfec5f8ed994633fa8415d9da7c904bc43bd962c9a6f51a9aecc6",
+        "action": "BUY",
+        "side": "UP",
+        "price": 0.15,
+        "size": 6.428569,
+        "pnl": 1.0
+    },
+    {
+        "timestamp": 1773009543,
+        "time_str": "2026-03-08 22:39:03",
+        "condition_id": "0x6e124aef173b969950a031b7c6bae5f6e707dfcfef1e85074658138f82ffbcb9",
+        "action": "BUY",
+        "side": "DOWN",
+        "price": 0.06,
+        "size": 5.963852,
+        "pnl": null
+    },
+    {
+        "timestamp": 1773009555,
+        "time_str": "2026-03-08 22:39:15",
+        "condition_id": "0x6e124aef173b969950a031b7c6bae5f6e707dfcfef1e85074658138f82ffbcb9",
+        "action": "BUY",
+        "side": "DOWN",
+        "price": 0.74,
+        "size": 6.689188,
+        "pnl": 12.56146
+    },
+    {
+        "timestamp": 1773010110,
+        "time_str": "2026-03-08 22:48:30",
+        "condition_id": "0xba5550661230c308142ab721aaee4844a892692c8073913d34dc2687ad989969",
+        "action": "BUY",
+        "side": "UP",
+        "price": 0.58,
+        "size": 5.051,
+        "pnl": 5.05052
+    },
+    {
+        "timestamp": 1773010410,
+        "time_str": "2026-03-08 22:53:30",
+        "condition_id": "0xdf740a9bc1c33de483f9fc9a1d43d32b6c88e61dba29a741b07ca534f4c435f9",
+        "action": "BUY",
+        "side": "UP",
+        "price": 0.32,
+        "size": 6.981614,
+        "pnl": 6.907324
+    }
+]
