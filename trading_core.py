@@ -1,7 +1,8 @@
 import os
 import asyncio
 import tg_utils
-import json
+import orjson
+import re
 from datetime import datetime, timezone
 from web3 import Web3
 from dotenv import load_dotenv
@@ -57,7 +58,7 @@ def get_client() -> ClobClient:
 
 async def buy(market_token_id: str, price: float, size: float):
     client = get_client()
-    order_args = OrderArgs(price=0.99, size=size, side=BUY, token_id=market_token_id)
+    order_args = OrderArgs(price=price, size=size, side=BUY, token_id=market_token_id)
 
     try:
         signed_order = client.create_order(order_args)
@@ -85,7 +86,7 @@ async def sell(market_token_id: str, price: float, size: float):
 
 # --- Cashout Logic ---
 
-async def _cashout_task(condition_id: str, bought_token_id: str, end_date_iso: str):
+async def _cashout_task(condition_id: str, bought_token_id: str, end_date_iso: str, side_name: str, spend_usdt: float):
     """
     Monitors market resolution and executes a gasless redemption via the Relayer.
     """
@@ -106,8 +107,8 @@ async def _cashout_task(condition_id: str, bought_token_id: str, end_date_iso: s
     # 2. Wait for Oracle Settlement (payoutDenominator > 0)
     ctf_contract = w3.eth.contract(
         address=w3.to_checksum_address(CTF_ADDRESS),
-        abi=json.loads(
-            '[{"constant":true,"inputs":[{"name":"","type":"bytes32"}],"name":"payoutDenominator","outputs":[{"name":"","type":"uint256"}],"type":"function"},{"constant":true,"inputs":[{"name":"","type":"address"},{"name":"","type":"uint256"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"}]')
+        abi=orjson.loads(
+            b'[{"constant":true,"inputs":[{"name":"","type":"bytes32"}],"name":"payoutDenominator","outputs":[{"name":"","type":"uint256"}],"type":"function"},{"constant":true,"inputs":[{"name":"","type":"bytes32"},{"name":"","type":"uint256"}],"name":"payoutNumerators","outputs":[{"name":"","type":"uint256"}],"type":"function"},{"constant":true,"inputs":[{"name":"","type":"address"},{"name":"","type":"uint256"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"}]')
     )
     cond_bytes = w3.to_bytes(hexstr=condition_id)
 
@@ -118,17 +119,23 @@ async def _cashout_task(condition_id: str, bought_token_id: str, end_date_iso: s
             break
         await asyncio.sleep(60)
 
-    # 3. Check Winning Balance
+    # 3. Check Winning Index properly
+    index = 0 if side_name == "UP" else 1
+    payout_num = await asyncio.to_thread(ctf_contract.functions.payoutNumerators(cond_bytes, index).call)
+    
+    if payout_num == 0:
+        print("[-] [Cashout] Market Resolved: Result was a LOSS.")
+        tg_utils.update_trade_pnl(condition_id, -spend_usdt)
+        tg_utils.send_tg_msg(f"❌ <b>MARKET RESOLVED: LOST</b>\nTokens for {condition_id[:8]}... expired worthless.\nPnL: <b>-${spend_usdt:.2f} USDC</b>")
+        return
+
+    # We won! Calculate actual payload value and precise PnL 
     balance = await asyncio.to_thread(
         ctf_contract.functions.balanceOf(w3.to_checksum_address(funder), int(bought_token_id)).call
     )
-    if balance == 0:
-        print("[-] [Cashout] Market Resolved: Result was a LOSS (0 tokens).")
-        tg_utils.update_trade_pnl(condition_id, 0.0)
-        tg_utils.send_tg_msg(f"❌ <b>MARKET RESOLVED: LOST</b>\nTokens for {condition_id[:8]}... expired worthless.")
-        return
-
-    print(f"[+] [Cashout] Winning position confirmed: {balance / 1e6} USDC potential.")
+    payout_usdc = balance / 1e6
+    pnl = payout_usdc - spend_usdt
+    print(f"[+] [Cashout] Winning position confirmed: {payout_usdc} USDC potential.")
 
     # 4. Prepare Redemption Data
     redeem_abi = [{"name": "redeemPositions", "type": "function",
@@ -171,16 +178,33 @@ async def _cashout_task(condition_id: str, bought_token_id: str, end_date_iso: s
 
         if response and hasattr(response, 'transaction_hash'):
             print(f"\n[$$$] CASHOUT SUCCESS! Hash: {response.transaction_hash}")
-            tg_utils.update_trade_pnl(condition_id, balance / 1e6)
-            tg_utils.send_tg_msg(f"✅ <b>MARKET RESOLVED: WON!</b>\nPayout: <b>${balance / 1e6:.2f} USDC</b>")
+            tg_utils.update_trade_pnl(condition_id, pnl)
+            tg_utils.send_tg_msg(f"✅ <b>MARKET RESOLVED: WON!</b>\nPayout: <b>${payout_usdc:.2f} USDC</b>\nPnL: <b>+${pnl:.2f} USDC</b>")
         else:
             print(f"[-] Cashout failed. Relayer response: {response}")
-            tg_utils.update_trade_pnl(condition_id, balance / 1e6)
-            tg_utils.send_tg_msg(f"⚠️ <b>WON (Failed Auto-Cashout)</b>\nPayout: <b>${balance / 1e6:.2f} USDC</b>")
+            tg_utils.update_trade_pnl(condition_id, pnl)
+            tg_utils.send_tg_msg(f"⚠️ <b>WON (Failed Auto-Cashout)</b>\nPayout: <b>${payout_usdc:.2f} USDC</b>\nPnL: <b>+${pnl:.2f} USDC</b>")
 
     except Exception as e:
-        print(f"[!] Cashout execution failed: {e}")
+        err_msg = str(e)
+        
+        # Clean up the Polymarket API Exception fluff
+        match = re.search(r"error_message=\{?'error':\s*'([^']+)'", err_msg)
+        if match:
+            clean_err = match.group(1)
+        else:
+            # Fallback for unexpected errors
+            clean_err = err_msg[:60] + "..." if len(err_msg) > 60 else err_msg
+            
+        if "quota exceeded" in err_msg.lower():
+            print(f"[!] Relayer Quota Exhausted: {clean_err}")
+            tg_utils.update_trade_pnl(condition_id, pnl)
+            tg_utils.send_tg_msg(f"⛔️ <b>CASHOUT BLOCKED (Rate Limit)</b>\nPayout: <b>${payout_usdc:.2f} USDC</b>\n<i>Error: {clean_err}</i>")
+        else:
+            print(f"[!] Cashout execution failed: {clean_err}")
+            tg_utils.update_trade_pnl(condition_id, pnl)
+            tg_utils.send_tg_msg(f"⚠️ <b>WON (Failed Auto-Cashout)</b>\nPayout: <b>${payout_usdc:.2f} USDC</b>\n<i>Error: {clean_err}</i>")
 
 
-def cashout_background(condition_id: str, bought_token_id: str, end_date_iso):
-    return asyncio.create_task(_cashout_task(condition_id, bought_token_id, end_date_iso))
+def cashout_background(condition_id: str, bought_token_id: str, end_date_iso: str, side_name: str, spend_usdt: float):
+    return asyncio.create_task(_cashout_task(condition_id, bought_token_id, end_date_iso, side_name, spend_usdt))

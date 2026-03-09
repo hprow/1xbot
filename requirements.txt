@@ -2,6 +2,7 @@ websockets
 aiohttp
 requests
 python-dotenv
+orjson
 web3
 py-clob-client
 py-builder-relayer-client
