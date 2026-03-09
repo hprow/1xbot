@@ -14,16 +14,18 @@ import trading_core as tc
 import tg_utils
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
 # --- Strategy Configurables ---
-TRADE_USDT = float(os.getenv("TRADE_USDT", "5.0"))               # Target amount to spend in USDT
-STOP_LOSS_PRICE = float(os.getenv("STOP_LOSS_PRICE", "0.2"))     # Minimum Bid price to trigger a stop loss
-MIN_BTC_HEIGHT = float(os.getenv("MIN_BTC_HEIGHT", "55.0"))      # Minimum signed (BTC Current - BTC Open) required
-MAX_REMAINING_TIME = int(os.getenv("MAX_REMAINING_TIME", "90"))  # Max remaining seconds in the 5m event to allow an entry
-MIN_REMAINING_TIME = int(os.getenv("MIN_REMAINING_TIME", "5"))   # Min remaining seconds (don't enter at the last second)
-API_COOLDOWN = float(os.getenv("API_COOLDOWN", "1.0"))           # Cooldown to prevent rapid-fire failures
-MAX_ENTRY_PRICE = float(os.getenv("MAX_ENTRY_PRICE", "0.97"))    # ABSOLUTE SAFETY: Max acceptable entry price
+TRADE_USDT = float(os.getenv("TRADE_USDT", "5.0"))  # Target amount to spend in USDT
+STOP_LOSS_PRICE = float(os.getenv("STOP_LOSS_PRICE", "0.2"))  # Minimum Bid price to trigger a stop loss
+MIN_BTC_HEIGHT = float(os.getenv("MIN_BTC_HEIGHT", "55.0"))  # Minimum signed (BTC Current - BTC Open) required
+MAX_REMAINING_TIME = int(
+    os.getenv("MAX_REMAINING_TIME", "90"))  # Max remaining seconds in the 5m event to allow an entry
+MIN_REMAINING_TIME = int(os.getenv("MIN_REMAINING_TIME", "5"))  # Min remaining seconds (don't enter at the last second)
+API_COOLDOWN = float(os.getenv("API_COOLDOWN", "1.0"))  # Cooldown to prevent rapid-fire failures
+MAX_ENTRY_PRICE = float(os.getenv("MAX_ENTRY_PRICE", "0.97"))  # ABSOLUTE SAFETY: Max acceptable entry price
 
 
 class PolyTrader:
@@ -49,6 +51,7 @@ class PolyTrader:
         # Trade & Safety State
         self.trade_executed = False
         self.trade_exited = False
+        self.trade_failed = False
         self.trade_lock = False
         self.last_trade_attempt = 0.0
 
@@ -97,7 +100,7 @@ class PolyTrader:
 
                         self.orderbooks = {self.yes_token: {"b": {}, "a": {}}, self.no_token: {"b": {}, "a": {}}}
                         self.btc_open = None
-                        self.trade_executed = self.trade_exited = self.trade_lock = False
+                        self.trade_executed = self.trade_exited = self.trade_failed = self.trade_lock = False
 
                         print(f"[+] Locked Event: {self.slug}")
 
@@ -127,7 +130,7 @@ class PolyTrader:
                             print(f"\n[+] Synced :00 Open Price: ${self.btc_open:.2f}")
 
                         if self.btc_open:
-                            pass # Strategy evaluation is now handled by the async heartbeat
+                            pass  # Strategy evaluation is now handled by the async heartbeat
             except Exception:
                 await asyncio.sleep(2)
 
@@ -179,7 +182,7 @@ class PolyTrader:
         rem_time = int(self.expiry_ts - time.time())
         btc_delta = self.current_btc_px - self.btc_open
 
-        if not self.trade_executed and MIN_REMAINING_TIME < rem_time < MAX_REMAINING_TIME:
+        if not self.trade_executed and not self.trade_failed and MIN_REMAINING_TIME < rem_time < MAX_REMAINING_TIME:
             if btc_delta > MIN_BTC_HEIGHT:
                 await self.execute_trade(self.yes_token, "UP")
             elif btc_delta < -MIN_BTC_HEIGHT:
@@ -230,14 +233,17 @@ class PolyTrader:
 
                 print(
                     f"[+] Trade Success! Spent ~${float(resp.get('makingAmount', 0)):.2f} for {self.trade_size_tokens} tokens.")
-                    
+
                 tg_utils.log_trade(self.condition_id, "BUY", side_name, limit_price, self.trade_size_tokens)
-                tg_utils.send_tg_msg(f"🚨 <b>ENTRY: {side_name}</b>\nPrice: ${limit_price:.2f} | Tokens: {self.trade_size_tokens:.1f}\nSpend: ${float(resp.get('makingAmount', 0)):.2f}")
+                tg_utils.send_tg_msg(
+                    f"🚨 <b>ENTRY: {side_name}</b>\nPrice: ${limit_price:.2f} | Tokens: {self.trade_size_tokens:.1f}\nSpend: ${float(resp.get('makingAmount', 0)):.2f}")
             else:
                 err = resp.get("error_message") if resp else "Unknown"
-                print(f"[-] BUY Failed: {err}. Price may have moved past limit {limit_price}.")
+                print(f"[-] BUY Failed: {err}. Skipping remainder of event.")
+                self.trade_failed = True
         except Exception as e:
-            print(f"[-] Exception during execution: {e}")
+            print(f"[-] Exception during execution: {e}. Skipping remainder of event.")
+            self.trade_failed = True
         finally:
             self.trade_lock = False
 
@@ -251,22 +257,24 @@ class PolyTrader:
                 self.trade_exited = True
                 print("[+] Stop Loss Executed.")
                 tg_utils.log_trade(self.condition_id, "SELL", self.owned_side_name, 0.01, self.trade_size_tokens)
-                tg_utils.send_tg_msg(f"⚠️ <b>STOP LOSS TRIGGERED</b>\nDumped {self.trade_size_tokens} {self.owned_side_name} tokens at market to prevent further loss.")
+                tg_utils.send_tg_msg(
+                    f"⚠️ <b>STOP LOSS TRIGGERED</b>\nDumped {self.trade_size_tokens} {self.owned_side_name} tokens at market to prevent further loss.")
         finally:
             self.trade_lock = False
 
     async def run(self):
         print("=== Polymarket BTC 5m Trader (Atomic Execution) ===")
-        
+
         # Startup Diagnostics
         hostname = socket.gethostname()
         try:
             ip = requests.get('https://api.ipify.org', timeout=3).text
         except:
             ip = "Unknown"
-            
-        tg_utils.send_tg_msg(f"🟢 <b>Trader Bot Started</b>\nHost: {hostname}\nIP: {ip}\nTargeting: Polymarket 5m BTC\nStatus: Running")
-        
+
+        tg_utils.send_tg_msg(
+            f"🟢 <b>Trader Bot Started</b>\nHost: {hostname}\nIP: {ip}\nTargeting: Polymarket 5m BTC\nStatus: Running")
+
         self.session = aiohttp.ClientSession()
         asyncio.create_task(self.binance_stream())
         asyncio.create_task(self.strategy_heartbeat())
@@ -276,7 +284,7 @@ class PolyTrader:
                 print("[*] Trader is PAUSED. Sleeping for 30s before checking again...")
                 await asyncio.sleep(30)
                 continue
-                
+
             await self.fetch_active_market()
             stop_event = asyncio.Event()
             poly_task = asyncio.create_task(self.polymarket_stream(stop_event))
