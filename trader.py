@@ -127,7 +127,7 @@ class PolyTrader:
                             print(f"\n[+] Synced :00 Open Price: ${self.btc_open:.2f}")
 
                         if self.btc_open:
-                            await self.evaluate_strategy()
+                            pass # Strategy evaluation is now handled by the async heartbeat
             except Exception:
                 await asyncio.sleep(2)
 
@@ -144,6 +144,9 @@ class PolyTrader:
                             etype = item.get("event_type") or item.get("event")
                             tid = item.get("asset_id") or item.get("market")
                             if etype == "book":
+                                # Prune old ghost levels by clearing the local dict before applying the new snapshot
+                                self.orderbooks[tid]["b"].clear()
+                                self.orderbooks[tid]["a"].clear()
                                 for b in item.get("bids", []): self.orderbooks[tid]["b"][float(b["price"])] = float(
                                     b["size"])
                                 for a in item.get("asks", []): self.orderbooks[tid]["a"][float(a["price"])] = float(
@@ -156,16 +159,21 @@ class PolyTrader:
                                         target.pop(px, None)
                                     else:
                                         target[px] = sz
-                        if self.btc_open: await self.evaluate_strategy()
+                        # Strategy evaluation is now handled by the async heartbeat
             except Exception:
                 if not stop_event.is_set(): await asyncio.sleep(2)
+
+    async def strategy_heartbeat(self):
+        """Runs continuously to decouple condition checking from websocket volume."""
+        print("[*] Strategy Heartbeat Started (10Hz)")
+        while self.running:
+            if self.btc_open and self.yes_token in self.orderbooks:
+                await self.evaluate_strategy()
+            await asyncio.sleep(0.1)
 
     async def evaluate_strategy(self):
         """Triggers the trade function if conditions are met."""
         if self.trade_lock or (time.time() - self.last_trade_attempt < API_COOLDOWN):
-            return
-            
-        if tg_utils.is_bot_paused():
             return
 
         rem_time = int(self.expiry_ts - time.time())
@@ -261,8 +269,14 @@ class PolyTrader:
         
         self.session = aiohttp.ClientSession()
         asyncio.create_task(self.binance_stream())
+        asyncio.create_task(self.strategy_heartbeat())
 
         while self.running:
+            if tg_utils.is_bot_paused():
+                print("[*] Trader is PAUSED. Sleeping for 30s before checking again...")
+                await asyncio.sleep(30)
+                continue
+                
             await self.fetch_active_market()
             stop_event = asyncio.Event()
             poly_task = asyncio.create_task(self.polymarket_stream(stop_event))
