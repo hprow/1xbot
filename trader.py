@@ -52,6 +52,7 @@ class PolyTrader:
         self.trade_executed = False
         self.trade_exited = False
         self.trade_failed = False
+        self.stop_loss_failed = False
         self.trade_lock = False
         self.last_trade_attempt = 0.0
 
@@ -100,7 +101,7 @@ class PolyTrader:
 
                         self.orderbooks = {self.yes_token: {"b": {}, "a": {}}, self.no_token: {"b": {}, "a": {}}}
                         self.btc_open = None
-                        self.trade_executed = self.trade_exited = self.trade_failed = self.trade_lock = False
+                        self.trade_executed = self.trade_exited = self.trade_failed = self.stop_loss_failed = self.trade_lock = False
 
                         print(f"[+] Locked Event: {self.slug}")
 
@@ -188,7 +189,7 @@ class PolyTrader:
             elif btc_delta < -MIN_BTC_HEIGHT:
                 await self.execute_trade(self.no_token, "DOWN")
 
-        elif self.trade_executed and not self.trade_exited:
+        elif self.trade_executed and not self.trade_exited and not self.stop_loss_failed:
             bid = max(self.orderbooks[self.owned_token_id]["b"].keys()) if self.orderbooks[self.owned_token_id][
                 "b"] else 0.0
             if 0 < bid <= STOP_LOSS_PRICE:
@@ -259,6 +260,13 @@ class PolyTrader:
                 tg_utils.log_trade(self.condition_id, "SELL", self.owned_side_name, 0.01, self.trade_size_tokens)
                 tg_utils.send_tg_msg(
                     f"⚠️ <b>STOP LOSS TRIGGERED</b>\nDumped {self.trade_size_tokens} {self.owned_side_name} tokens at market to prevent further loss.")
+            else:
+                err = resp.get("error_message") if resp else "Unknown"
+                print(f"[-] Stop Loss Failed: {err}. Abandoning stop loss attempts.")
+                self.stop_loss_failed = True
+        except Exception as e:
+            print(f"[-] Exception during stop loss: {e}. Abandoning stop loss attempts.")
+            self.stop_loss_failed = True
         finally:
             self.trade_lock = False
 
