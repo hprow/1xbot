@@ -40,8 +40,8 @@ class PolyTrader:
 
         # Live Pricing State
         self.btc_open = None
-        self.current_btc_px = 0.0
-        self.req_pct = 0.0
+        self.current_btc_px = None
+        self.req_pct = None
 
         # { token_id: { "b": { price: size }, "a": { price: size } } }
         self.orderbooks = {}
@@ -150,7 +150,9 @@ class PolyTrader:
 
     async def evaluate_strategy(self):
         """Triggers the trade function if conditions are met."""
-        if self.trade_lock or (time.time() - self.last_trade_attempt < API_COOLDOWN):
+        if any(v is None for v in [self.btc_open, self.req_pct, self.current_btc_px]):
+            return
+        if self.trade_lock or (time.time() - self.last_trade_attempt < API_COOLDOWN) or self.current_btc_px == 0:
             return
 
         rem_time = int(self.expiry_ts - time.time())
