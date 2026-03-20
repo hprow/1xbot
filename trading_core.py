@@ -2,7 +2,6 @@ import os
 import asyncio
 import tg_utils
 import orjson
-import re
 from datetime import datetime, timezone
 from web3 import Web3
 from dotenv import load_dotenv
@@ -22,35 +21,38 @@ load_dotenv()
 CTF_ADDRESS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 USDC_E_ADDRESS = "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"
 
+CTF_ABI = orjson.loads(
+    b'[{"constant":true,"inputs":[{"name":"","type":"bytes32"}],"name":"payoutDenominator","outputs":[{"name":"","type":"uint256"}],"type":"function"},{"constant":true,"inputs":[{"name":"","type":"bytes32"},{"name":"","type":"uint256"}],"name":"payoutNumerators","outputs":[{"name":"","type":"uint256"}],"type":"function"},{"constant":true,"inputs":[{"name":"","type":"address"},{"name":"","type":"uint256"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"}]')
+REDEEM_ABI = [{"name": "redeemPositions", "type": "function", "inputs": [{"name": "collateralToken", "type": "address"},
+                                                                         {"name": "parentCollectionId",
+                                                                          "type": "bytes32"},
+                                                                         {"name": "conditionId", "type": "bytes32"},
+                                                                         {"name": "indexSets", "type": "uint256[]"}]}]
+
 _client = None
+_cached_fee_rate = None
 
 
 def get_client() -> ClobClient:
     global _client
-    if _client is not None:
-        return _client
+    if _client is not None: return _client
 
     pk = os.getenv("POLY_PRIVATE_KEY")
-    # This must be the "Proxy" address you just found in the UI
     funder = os.getenv("POLY_FUNDER_ADDRESS")
 
     if not pk or not funder:
         raise ValueError("Missing POLY_PRIVATE_KEY or POLY_FUNDER_ADDRESS in .env")
 
-    # 1. Initialize for Gnosis Safe (MetaMask + Proxy)
     _client = ClobClient(
         host="https://clob.polymarket.com",
         chain_id=137,
-        key=pk,  # Your MetaMask Private Key
-        signature_type=2,  # 2 = Gnosis Safe / Proxy
-        funder=funder  # Your Vault Address
+        key=pk,
+        signature_type=2,
+        funder=funder
     )
-
-    # 2. Derive API credentials
     print(f"[*] Authenticating Proxy Vault: {funder[:10]}...")
     creds = _client.create_or_derive_api_creds()
     _client.set_api_creds(creds)
-
     return _client
 
 
@@ -59,152 +61,158 @@ def get_client() -> ClobClient:
 async def buy(market_token_id: str, price: float, size: float):
     client = get_client()
     order_args = OrderArgs(price=price, size=size, side=BUY, token_id=market_token_id)
-
     try:
         signed_order = client.create_order(order_args)
         resp = await asyncio.to_thread(client.post_order, signed_order, OrderType.FOK)
-        print(f"[+] BUY Success: {resp}")
+        print(f"[+] BUY Call Completed. Resp: {resp}")
         return resp
     except Exception as e:
-        print(f"[-] BUY Failed: {e}")
+        print(f"[-] BUY Call Exception: {e}")
         return None
 
 
 async def sell(market_token_id: str, price: float, size: float):
     client = get_client()
     order_args = OrderArgs(price=0.01, size=size, side=SELL, token_id=market_token_id)
-
     try:
         signed_order = client.create_order(order_args)
         resp = await asyncio.to_thread(client.post_order, signed_order, OrderType.FOK)
-        print(f"[+] SELL Success: {resp}")
         return resp
     except Exception as e:
-        print(f"[-] SELL Failed: {e}")
+        print(f"[-] SELL Call Exception: {e}")
         return None
 
 
-# --- Cashout Logic ---
+# --- Verification Logic ---
 
-async def _cashout_task(condition_id: str, bought_token_id: str, end_date_iso: str, side_name: str, spend_usdt: float):
+async def get_token_balance(token_id: str) -> float:
+    """Reads the exact amount of conditional tokens currently sitting in the proxy vault."""
+    try:
+        w3 = Web3(Web3.HTTPProvider(os.getenv("POLYGON_RPC")))
+        funder = os.getenv("POLY_FUNDER_ADDRESS")
+        ctf_contract = w3.eth.contract(address=w3.to_checksum_address(CTF_ADDRESS), abi=CTF_ABI)
+
+        balance = await asyncio.to_thread(
+            ctf_contract.functions.balanceOf(w3.to_checksum_address(funder), int(token_id)).call
+        )
+        return float(balance) / 1e6  # Polymarket Tokens natively use 6 decimals
+    except Exception as e:
+        print(f"[-] Error querying chain for token balance: {e}")
+        return 0.0
+
+
+# --- Batched Cashout Logic ---
+
+async def process_batch_cashouts(pending_trades: list) -> list:
     """
-    Monitors market resolution and executes a gasless redemption via the Relayer.
+    Evaluates unresolved trades. Discards losses, constructs SafeTransaction payloads for wins,
+    and executes them all simultaneously to consume exactly ONE Relayer quota interaction.
+    Returns the list of trades that are STILL awaiting resolution.
     """
+    if not pending_trades:
+        return []
+
     w3 = Web3(Web3.HTTPProvider(os.getenv("POLYGON_RPC")))
     funder = os.getenv("POLY_FUNDER_ADDRESS")
     pk = os.getenv("POLY_PRIVATE_KEY")
 
-    # 1. Wait for Expiration
-    try:
-        end_time = datetime.fromisoformat(end_date_iso.replace("Z", "+00:00"))
-        print(f"[*] [Cashout] Monitoring market until {end_time.strftime('%H:%M:%S')}...")
-        while datetime.now(timezone.utc) < end_time:
-            await asyncio.sleep(30)
-        await asyncio.sleep(20)  # Buffer for block confirmation
-    except Exception as e:
-        print(f"[!] Timer error: {e}")
+    ctf_contract = w3.eth.contract(address=w3.to_checksum_address(CTF_ADDRESS), abi=CTF_ABI)
 
-    # 2. Wait for Oracle Settlement (payoutDenominator > 0)
-    ctf_contract = w3.eth.contract(
-        address=w3.to_checksum_address(CTF_ADDRESS),
-        abi=orjson.loads(
-            b'[{"constant":true,"inputs":[{"name":"","type":"bytes32"}],"name":"payoutDenominator","outputs":[{"name":"","type":"uint256"}],"type":"function"},{"constant":true,"inputs":[{"name":"","type":"bytes32"},{"name":"","type":"uint256"}],"name":"payoutNumerators","outputs":[{"name":"","type":"uint256"}],"type":"function"},{"constant":true,"inputs":[{"name":"","type":"address"},{"name":"","type":"uint256"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"}]')
-    )
-    cond_bytes = w3.to_bytes(hexstr=condition_id)
+    still_pending = []
+    tx_batch = []
+    won_trades_info = []
 
-    print("[*] [Cashout] Waiting for Oracle to resolve market...")
-    while True:
+    now_ts = datetime.now(timezone.utc).timestamp()
+
+    for trade in pending_trades:
+        cond_id = trade["condition_id"]
+
+        # 1. Skip if the event hasn't expired yet
+        if now_ts < trade["expiry_ts"]:
+            still_pending.append(trade)
+            continue
+
+        cond_bytes = w3.to_bytes(hexstr=cond_id)
+
+        # 2. Check if Oracle has resolved the market
         denom = await asyncio.to_thread(ctf_contract.functions.payoutDenominator(cond_bytes).call)
-        if denom > 0:
-            break
-        await asyncio.sleep(60)
+        if denom == 0:
+            # Oracle has not populated the result yet
+            still_pending.append(trade)
+            continue
 
-    # 3. Check Winning Index properly
-    index = 0 if side_name == "UP" else 1
-    payout_num = await asyncio.to_thread(ctf_contract.functions.payoutNumerators(cond_bytes, index).call)
-    
-    if payout_num == 0:
-        print("[-] [Cashout] Market Resolved: Result was a LOSS.")
-        tg_utils.update_trade_pnl(condition_id, -spend_usdt)
-        tg_utils.send_tg_msg(f"❌ <b>MARKET RESOLVED: LOST</b>\nTokens for {condition_id[:8]}... expired worthless.\nPnL: <b>-${spend_usdt:.2f} USDC</b>")
-        return
+        # 3. Assess Result
+        index = 0 if trade["side_name"] == "UP" else 1
+        payout_num = await asyncio.to_thread(ctf_contract.functions.payoutNumerators(cond_bytes, index).call)
 
-    # We won! Calculate actual payload value and precise PnL 
-    balance = await asyncio.to_thread(
-        ctf_contract.functions.balanceOf(w3.to_checksum_address(funder), int(bought_token_id)).call
-    )
-    payout_usdc = balance / 1e6
-    pnl = payout_usdc - spend_usdt
-    print(f"[+] [Cashout] Winning position confirmed: {payout_usdc} USDC potential.")
+        if payout_num == 0:
+            # 📉 LOST
+            tg_utils.update_trade_pnl(cond_id, -trade["spend"])
+            tg_utils.send_tg_msg(
+                f"❌ <b>MARKET RESOLVED: LOST</b>\nTokens for {cond_id[:8]}... expired worthless.\nPnL: <b>-${trade['spend']:.2f} USDC</b>")
+            continue
 
-    # 4. Prepare Redemption Data
-    redeem_abi = [{"name": "redeemPositions", "type": "function",
-                   "inputs": [{"name": "collateralToken", "type": "address"},
-                              {"name": "parentCollectionId", "type": "bytes32"},
-                              {"name": "conditionId", "type": "bytes32"}, {"name": "indexSets", "type": "uint256[]"}]}]
-    call_data = w3.eth.contract(abi=redeem_abi).encode_abi(
-        "redeemPositions",
-        [w3.to_checksum_address(USDC_E_ADDRESS), b'\x00' * 32, cond_bytes, [1, 2]]
-    )
+        # 📈 WON - Calculate payout
+        balance = await asyncio.to_thread(
+            ctf_contract.functions.balanceOf(w3.to_checksum_address(funder), int(trade["token_id"])).call
+        )
 
-    # 5. Initialize Relayer Client
-    creds = BuilderApiKeyCreds(
-        key=os.getenv("POLY_BUILDER_API_KEY"),
-        secret=os.getenv("POLY_BUILDER_SECRET"),
-        passphrase=os.getenv("POLY_BUILDER_PASSPHRASE")
-    )
+        if balance == 0:
+            continue  # Already redeemed or manually dumped
 
-    relayer = RelayClient(
-        relayer_url="https://relayer-v2.polymarket.com/",
-        chain_id=137,
-        private_key=pk,
-        builder_config=BuilderConfig(local_builder_creds=creds)
-    )
+        payout_usdc = balance / 1e6
+        pnl = payout_usdc - trade["spend"]
 
-    # 6. Execute Gasless Transaction using Correct Object Types
-    try:
-        # Wrap the payload in the individual SafeTransaction class
+        # 4. Construct the SafeTransaction for this winning condition
+        call_data = w3.eth.contract(abi=REDEEM_ABI).encode_abi(
+            "redeemPositions",
+            [w3.to_checksum_address(USDC_E_ADDRESS), b'\x00' * 32, cond_bytes, [1, 2]]
+        )
+
         tx = SafeTransaction(
             to=w3.to_checksum_address(CTF_ADDRESS),
             operation=OperationType.Call,
             data=call_data,
-            value="0"  # Passed as a string to satisfy the SDK's strict typing
+            value="0"
+        )
+        tx_batch.append(tx)
+        won_trades_info.append({"trade": trade, "payout_usdc": payout_usdc, "pnl": pnl})
+
+    # 5. Execute all SafeTransactions in one massive Relayer Call
+    if tx_batch:
+        print(f"[*] [Batch Cashout] Executing gasless redemption for {len(tx_batch)} winning markets...")
+
+        creds = BuilderApiKeyCreds(
+            key=os.getenv("POLY_BUILDER_API_KEY"),
+            secret=os.getenv("POLY_BUILDER_SECRET"),
+            passphrase=os.getenv("POLY_BUILDER_PASSPHRASE")
+        )
+        relayer = RelayClient(
+            relayer_url="https://relayer-v2.polymarket.com/",
+            chain_id=137,
+            private_key=pk,
+            builder_config=BuilderConfig(local_builder_creds=creds)
         )
 
-        print("[*] [Cashout] Sending gasless redemption via Relayer...")
+        try:
+            # Passing a list of transactions executes them all under ONE block operation/quota limit
+            response = await asyncio.to_thread(relayer.execute, tx_batch, metadata="Batch Redeem Winnings")
 
-        # relayer.execute expects a list of SafeTransaction objects
-        response = await asyncio.to_thread(relayer.execute, [tx], metadata="Redeem Winings")
+            if response and hasattr(response, 'transaction_hash'):
+                print(f"\n[$$$] BATCH CASHOUT SUCCESS! Hash: {response.transaction_hash}")
+                for item in won_trades_info:
+                    tr = item["trade"]
+                    tg_utils.update_trade_pnl(tr["condition_id"], item["pnl"])
+                    tg_utils.send_tg_msg(
+                        f"✅ <b>MARKET RESOLVED: WON!</b>\nPayout: <b>${item['payout_usdc']:.2f} USDC</b>\nPnL: <b>+${item['pnl']:.2f} USDC</b>")
+            else:
+                print(f"[-] Batch cashout unexpected response: {response}")
+                # Keep them in pending to retry next cycle
+                still_pending.extend([item["trade"] for item in won_trades_info])
 
-        if response and hasattr(response, 'transaction_hash'):
-            print(f"\n[$$$] CASHOUT SUCCESS! Hash: {response.transaction_hash}")
-            tg_utils.update_trade_pnl(condition_id, pnl)
-            tg_utils.send_tg_msg(f"✅ <b>MARKET RESOLVED: WON!</b>\nPayout: <b>${payout_usdc:.2f} USDC</b>\nPnL: <b>+${pnl:.2f} USDC</b>")
-        else:
-            print(f"[-] Cashout failed. Relayer response: {response}")
-            tg_utils.update_trade_pnl(condition_id, pnl)
-            tg_utils.send_tg_msg(f"⚠️ <b>WON (Failed Auto-Cashout)</b>\nPayout: <b>${payout_usdc:.2f} USDC</b>\nPnL: <b>+${pnl:.2f} USDC</b>")
+        except Exception as e:
+            print(f"[!] Batch Relayer execution failed: {e}")
+            # Keep them in pending if the Relayer threw a 429/quota error
+            still_pending.extend([item["trade"] for item in won_trades_info])
 
-    except Exception as e:
-        err_msg = str(e)
-        
-        # Clean up the Polymarket API Exception fluff
-        match = re.search(r"error_message=\{?'error':\s*'([^']+)'", err_msg)
-        if match:
-            clean_err = match.group(1)
-        else:
-            # Fallback for unexpected errors
-            clean_err = err_msg[:60] + "..." if len(err_msg) > 60 else err_msg
-            
-        if "quota exceeded" in err_msg.lower():
-            print(f"[!] Relayer Quota Exhausted: {clean_err}")
-            tg_utils.update_trade_pnl(condition_id, pnl)
-            tg_utils.send_tg_msg(f"⛔️ <b>CASHOUT BLOCKED (Rate Limit)</b>\nPayout: <b>${payout_usdc:.2f} USDC</b>\n<i>Error: {clean_err}</i>")
-        else:
-            print(f"[!] Cashout execution failed: {clean_err}")
-            tg_utils.update_trade_pnl(condition_id, pnl)
-            tg_utils.send_tg_msg(f"⚠️ <b>WON (Failed Auto-Cashout)</b>\nPayout: <b>${payout_usdc:.2f} USDC</b>\n<i>Error: {clean_err}</i>")
-
-
-def cashout_background(condition_id: str, bought_token_id: str, end_date_iso: str, side_name: str, spend_usdt: float):
-    return asyncio.create_task(_cashout_task(condition_id, bought_token_id, end_date_iso, side_name, spend_usdt))
+    return still_pending

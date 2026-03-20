@@ -31,10 +31,10 @@ def send_tg_msg(text: str):
     if not TG_BOT_TOKEN or not TG_CHAT_ID:
         print("[!] TG_BOT_TOKEN or TG_CHAT_ID missing in .env. Cannot send msg.")
         return
-        
+
     url = f"https://api.telegram.org/bot{TG_BOT_TOKEN}/sendMessage"
     chat_ids = [x.strip() for x in str(TG_CHAT_ID).split(",") if x.strip()]
-    
+
     for cid in chat_ids:
         payload = {"chat_id": cid, "text": text, "parse_mode": "HTML"}
         try:

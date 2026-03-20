@@ -6,5 +6,6 @@ orjson
 web3
 py-clob-client
 py-builder-relayer-client
-Telethon
+aiogram
 filelock
+uvloop
